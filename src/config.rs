@@ -2,30 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")] // Tự động map "auto" và "manual" từ string của Backend
+#[serde(rename_all = "lowercase")] // Sẽ parse "auto" hoặc "manual" từ Backend
 pub enum ControlMode {
     Auto,
     Manual,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)] // CỰC KỲ QUAN TRỌNG: Lấy giá trị Default nếu JSON từ Backend gửi thiếu field
+#[serde(default)] // Cực kỳ quan trọng: Điền mặc định nếu thiếu field
 pub struct DeviceConfig {
     pub device_id: String,
     pub control_mode: ControlMode,
     pub is_enabled: bool,
 
-    // ==========================================
-    // 1. NGƯỠNG MỤC TIÊU (Từ Bảng DeviceConfig)
-    // ==========================================
+    // 1. NGƯỠNG MỤC TIÊU
     pub ec_target: f32,
     pub ec_tolerance: f32,
     pub ph_target: f32,
     pub ph_tolerance: f32,
 
-    // ==========================================
-    // 2. QUẢN LÝ NƯỚC (Từ Bảng WaterConfig)
-    // ==========================================
+    // 2. QUẢN LÝ NƯỚC
     pub water_level_min: f32,
     pub water_level_target: f32,
     pub water_level_max: f32,
@@ -40,9 +36,7 @@ pub struct DeviceConfig {
     pub misting_on_duration_ms: u64,
     pub misting_off_duration_ms: u64,
 
-    // ==========================================
-    // 3. AN TOÀN (Từ Bảng SafetyConfig)
-    // ==========================================
+    // 3. AN TOÀN
     pub emergency_shutdown: bool,
     pub max_ec_limit: f32,
     pub min_ec_limit: f32,
@@ -54,14 +48,11 @@ pub struct DeviceConfig {
     pub water_level_critical_min: f32,
     pub max_refill_duration_sec: u64,
     pub max_drain_duration_sec: u64,
-
     pub ec_ack_threshold: f32,
     pub ph_ack_threshold: f32,
     pub water_ack_threshold: f32,
 
-    // ==========================================
-    // 4. CHÂM PHÂN (Từ Bảng DosingCalibration)
-    // ==========================================
+    // 4. CHÂM PHÂN
     pub ec_gain_per_ml: f32,
     pub ph_shift_up_per_ml: f32,
     pub ph_shift_down_per_ml: f32,
@@ -74,45 +65,30 @@ pub struct DeviceConfig {
     pub scheduled_mixing_interval_sec: u64,
     pub scheduled_mixing_duration_sec: u64,
 
-    // ==========================================
-    // 5. CẢM BIẾN (Từ Bảng SensorCalibration)
-    // ==========================================
+    // 5. CẢM BIẾN
     pub ph_v7: f32,
     pub ph_v4: f32,
     pub ec_factor: f32,
     pub ec_offset: f32,
     pub temp_offset: f32,
     pub temp_compensation_beta: f32,
-
-    // --- LỌC NHIỄU & TẦN SUẤT ---
     pub sampling_interval: u64,
     pub publish_interval: u64,
     pub moving_average_window: u32,
+    pub enable_ec_sensor: bool,
+    pub enable_ph_sensor: bool,
+    pub enable_water_level_sensor: bool,
+    pub enable_temp_sensor: bool,
 
-    // ==========================================
-    // 6. CÁC THÔNG SỐ LOCAL / MỞ RỘNG CỦA ESP32
-    // (Không có trong Backend nhưng FSM cần dùng)
-    // ==========================================
+    // 6. THÔNG SỐ LOCAL CỦA ESP32 (Backend không có cũng không sao)
     pub dosing_pwm_percent: u32,
     pub osaka_mixing_pwm_percent: u32,
     pub osaka_misting_pwm_percent: u32,
     pub misting_temp_threshold: f32,
     pub high_temp_misting_on_duration_ms: u64,
     pub high_temp_misting_off_duration_ms: u64,
-
-    // ==========================================
-    // 7. 🟢 CỜ BẬT/TẮT HARDWARE (HARDWARE TOGGLES)
-    // Cho phép hệ thống chạy bình thường dù thiếu cảm biến
-    // ==========================================
-    pub enable_ec_sensor: bool,
-    pub enable_ph_sensor: bool,
-    pub enable_water_level_sensor: bool,
-    pub enable_temp_sensor: bool,
 }
 
-// Bảng giá trị Mặc định (Hardcode)
-// CHỈ được dùng khi ESP32 vừa mất điện khởi động lên chưa có mạng
-// HOẶC khi Backend gửi thiếu Field nào đó.
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
@@ -150,7 +126,6 @@ impl Default for DeviceConfig {
             water_level_critical_min: 5.0,
             max_refill_duration_sec: 120,
             max_drain_duration_sec: 120,
-
             ec_ack_threshold: 0.05,
             ph_ack_threshold: 0.1,
             water_ack_threshold: 0.5,
@@ -167,16 +142,20 @@ impl Default for DeviceConfig {
             scheduled_mixing_interval_sec: 3600,
             scheduled_mixing_duration_sec: 300,
 
-            ph_v7: 2.5,
-            ph_v4: 3.0,
+            ph_v7: 1650.0,
+            ph_v4: 1846.4,
             ec_factor: 880.0,
             ec_offset: 0.0,
             temp_offset: 0.0,
             temp_compensation_beta: 0.02,
+            sampling_interval: 1000,
+            publish_interval: 5000,
+            moving_average_window: 10,
 
-            sampling_interval: 1000,   // Lấy mẫu mỗi 1 giây
-            publish_interval: 5000,    // Gửi MQTT mỗi 5 giây
-            moving_average_window: 10, // Lọc trung bình cộng 10 lần
+            enable_ec_sensor: true,
+            enable_ph_sensor: true,
+            enable_water_level_sensor: true,
+            enable_temp_sensor: true,
 
             dosing_pwm_percent: 50,
             osaka_mixing_pwm_percent: 60,
@@ -184,12 +163,6 @@ impl Default for DeviceConfig {
             misting_temp_threshold: 30.0,
             high_temp_misting_on_duration_ms: 15000,
             high_temp_misting_off_duration_ms: 60000,
-
-            // Mặc định cho phép toàn bộ cảm biến hoạt động
-            enable_ec_sensor: true,
-            enable_ph_sensor: true,
-            enable_water_level_sensor: true,
-            enable_temp_sensor: true,
         }
     }
 }
@@ -199,4 +172,3 @@ pub type SharedConfig = Arc<RwLock<DeviceConfig>>;
 pub fn create_shared_config() -> SharedConfig {
     Arc::new(RwLock::new(DeviceConfig::default()))
 }
-

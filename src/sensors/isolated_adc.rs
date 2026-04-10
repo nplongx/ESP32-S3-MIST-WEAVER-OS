@@ -1,5 +1,6 @@
 use crate::config::DeviceConfig;
 use esp_idf_hal::gpio::{Output, PinDriver};
+use log::debug;
 use std::thread;
 use std::time::Duration;
 
@@ -23,86 +24,73 @@ impl<'a> IsolatedPhEcReader<'a> {
             ec_mosfet,
         })
     }
+}
 
-    // Truyền một hàm Callback (closure) để đọc ADC thay vì truyền trực tiếp thiết bị
-    pub fn read_ph_voltage<F>(&mut self, mut read_adc_callback: F) -> anyhow::Result<f32>
-    where
-        F: FnMut() -> u16, // Hàm callback sẽ trả về giá trị ADC thô (u16)
-    {
-        // 1. NGẮT EC, BẬT pH
-        self.ec_mosfet.set_low()?;
-        self.ph_mosfet.set_high()?;
+// Trả về thẳng giá trị Millivolt (mV)
 
-        // 2. Chờ mạch làm nóng và ổn định điện áp
-        thread::sleep(Duration::from_millis(1500));
+pub fn convert_voltage_to_ec(voltage_mv: f32, current_temp_c: f32, config: &DeviceConfig) -> f32 {
+    // 🟢 SỬA LẠI CÔNG THỨC EC (Dành cho Cảm biến Analog chuẩn)
+    // voltage_mv thường từ 0 đến 3000mV.
+    // Hệ số ec_factor thường là 1.0 (Không phải 880.0). Tạm thời chia cho 1000 để ra Volt
+    let voltage_v = voltage_mv / 1000.0;
 
-        // 3. Đọc lấy mẫu nhiều lần để lọc nhiễu
-        let mut sum: u32 = 0;
-        let samples = 20;
-        for _ in 0..samples {
-            sum += read_adc_callback() as u32;
-            thread::sleep(Duration::from_millis(10));
-        }
+    // Công thức tính EC thô (Tùy thuộc mạch, đây là công thức tuyến tính cơ bản)
+    // Nếu bạn dùng ec_factor=880 trên Backend, hãy giảm nó xuống 1.0 trên UI React.
+    let mut raw_ec = (voltage_v * config.ec_factor) + config.ec_offset;
 
-        // 4. TẮT pH
-        self.ph_mosfet.set_low()?;
+    // Bù trừ nhiệt độ (Temperature Compensation)
+    let temp_coefficient = 1.0 + config.temp_compensation_beta * (current_temp_c - 25.0);
+    let mut ec_compensated = raw_ec / temp_coefficient;
 
-        let avg_mv = (sum as f32) / (samples as f32);
-        let voltage = avg_mv / 1000.0;
-        Ok(voltage)
+    // Chặn khoảng an toàn (Clamp)
+    if ec_compensated < 0.0 {
+        ec_compensated = 0.0;
     }
 
-    pub fn read_ec_voltage<F>(&mut self, mut read_adc_callback: F) -> anyhow::Result<f32>
-    where
-        F: FnMut() -> u16,
-    {
-        // 1. NGẮT pH, BẬT EC
-        self.ph_mosfet.set_low()?;
-        self.ec_mosfet.set_high()?;
+    // Đổi thành info! để nhìn thấy sự thật
+    log::info!(
+        "🧮 EC Calc | ADC đọc được: {:.1}mV -> Tính ra EC: {:.2} mS/cm (Factor={:.2})",
+        voltage_mv,
+        ec_compensated,
+        config.ec_factor
+    );
 
-        // 2. Chờ mạch ổn định
-        thread::sleep(Duration::from_millis(1500));
-
-        // 3. Đọc lấy mẫu
-        let mut sum: u32 = 0;
-        let samples = 20;
-        for _ in 0..samples {
-            sum += read_adc_callback() as u32;
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        // 4. TẮT EC
-        self.ec_mosfet.set_low()?;
-
-        let avg_mv = (sum as f32) / (samples as f32);
-        let voltage = avg_mv / 1000.0;
-        Ok(voltage)
-    }
+    ec_compensated
 }
 
 // =========================================
 // CÁC HÀM TÍNH TOÁN HIỆU CHUẨN (Calibration)
 // =========================================
 
-pub fn convert_voltage_to_ph(voltage: f32, config: &DeviceConfig) -> f32 {
-    let slope = (config.ph_v7 - config.ph_v4) / 3.0;
-    if slope.abs() < 0.001 {
-        return 7.0;
+pub fn convert_voltage_to_ph(voltage_mv: f32, config: &DeviceConfig) -> f32 {
+    // TẠM THỜI BỎ ĐIỀU KIỆN CHẶN VOLTAGE_MV ĐỂ NHÌN THẤY ĐIỆN ÁP THẬT
+
+    // Tránh lỗi chia cho 0 nếu chưa config đúng ph_v4 và ph_v7
+    let diff = config.ph_v4 - config.ph_v7;
+    let slope = if diff.abs() < 0.1 {
+        -0.006 // Giá trị Slope ước lượng mặc định nếu config chưa chuẩn
+    } else {
+        (4.0 - 7.0) / diff
+    };
+
+    // Tính pH
+    let mut ph = 7.0 + slope * (voltage_mv - config.ph_v7);
+
+    // Chặn khoảng an toàn (Clamp)
+    if ph < 0.0 {
+        ph = 0.0;
+    } else if ph > 14.0 {
+        ph = 14.0;
     }
-    let ph_current = 7.0 + (voltage - config.ph_v7) / slope;
-    ph_current.clamp(0.0, 14.0)
+
+    // Đổi thành info! để bạn LUÔN LUÔN thấy log này mà không cần cấu hình RUST_LOG
+    log::info!(
+        "🧮 pH Calc | ADC đọc được: {:.1}mV -> Tính ra pH: {:.2} (Config: v7={:.1}mV, v4={:.1}mV)",
+        voltage_mv,
+        ph,
+        config.ph_v7,
+        config.ph_v4
+    );
+
+    ph
 }
-
-pub fn convert_voltage_to_ec(voltage: f32, temperature_c: f32, config: &DeviceConfig) -> f32 {
-    if voltage <= 0.01 {
-        return 0.0;
-    }
-    let ec_raw_us = (voltage * config.ec_factor) + config.ec_offset;
-
-    let real_temp = temperature_c + config.temp_offset;
-    let temp_coefficient = 1.0 + config.temp_compensation_beta * (real_temp - 25.0);
-
-    let ec_ms = (ec_raw_us / temp_coefficient) / 1000.0;
-    ec_ms.clamp(0.0, 4.4)
-}
-

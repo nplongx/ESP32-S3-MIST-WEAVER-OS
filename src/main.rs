@@ -20,7 +20,6 @@ use esp_idf_hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
 use esp_idf_hal::gpio::Input;
 
 use sensors::ds18b20::HydroponicTempSensor;
-use sensors::isolated_adc::{convert_voltage_to_ec, convert_voltage_to_ph, IsolatedPhEcReader};
 use sensors::jsn_sr04t::JsnSr04t;
 
 mod config;
@@ -34,6 +33,7 @@ use mqtt::{create_shared_sensor_data, ConnectionState};
 use pump::PumpController;
 
 use crate::controller::start_fsm_control_loop;
+use crate::sensors::isolated_adc::{convert_voltage_to_ec, convert_voltage_to_ph};
 
 const WIFI_SSID: &str = "Huynh Hong";
 const WIFI_PASS: &str = "123443215";
@@ -63,7 +63,6 @@ fn main() -> anyhow::Result<()> {
         &TimerConfig::new().frequency(20000.Hz()),
     )?);
 
-    // --- NHÓM 1 & 2: KHỞI TẠO BƠM / VAN ---
     // --- NHÓM 1 & 2: KHỞI TẠO BƠM / VAN (ĐÃ ÁNH XẠ LẠI CHO ESP32-S3) ---
     let valve_mist = PinDriver::output(peripherals.pins.gpio11)?;
     let osaka_en = PinDriver::output(peripherals.pins.gpio12.degrade_output())?;
@@ -85,12 +84,6 @@ fn main() -> anyhow::Result<()> {
         timer_driver.clone(),
         peripherals.pins.gpio15,
     )?;
-
-    // let osaka_lpwm = LedcDriver::new(
-    //     peripherals.ledc.channel2,
-    //     timer_driver.clone(),
-    //     peripherals.pins.gpioX, // Nếu dùng lại, hãy cấu hình chân khác (vd: gpio43)
-    // )?;
 
     let pump_a = LedcDriver::new(
         peripherals.ledc.channel3,
@@ -126,7 +119,6 @@ fn main() -> anyhow::Result<()> {
         water_pump_out,
         osaka_en,
         osaka_rpwm,
-        // osaka_lpwm,
     )?;
 
     // ===============================
@@ -134,15 +126,24 @@ fn main() -> anyhow::Result<()> {
     // ===============================
     info!("Chuẩn bị các chân Cảm biến...");
 
+    // 🟢 Chuyển các chân ADC và chân chức năng thành biến để move vào trong thread
     let adc1_periph = peripherals.adc1;
+    let ph_pin = peripherals.pins.gpio4;
+    let ec_pin = peripherals.pins.gpio5;
 
-    let pin_gpio4 = peripherals.pins.gpio4; // ADC1_CH3 (pH)
-    let pin_gpio5 = peripherals.pins.gpio5; // ADC1_CH4 (EC)
-    let pin_gpio6 = peripherals.pins.gpio6; // DS18B20 Temp
-    let pin_gpio7 = peripherals.pins.gpio7; // Echo
-    let pin_gpio8 = peripherals.pins.gpio8; // Mosfet pH
-    let pin_gpio9 = peripherals.pins.gpio9; // Mosfet EC
-    let pin_gpio10 = peripherals.pins.gpio10; // Trig
+    // 🟢 Bỏ IsolatedPhEcReader, bật cứng 2 Mosfet để cấp nguồn liên tục
+    let mut ph_mosfet = PinDriver::output(peripherals.pins.gpio8).unwrap();
+    let mut ec_mosfet = PinDriver::output(peripherals.pins.gpio9).unwrap();
+    ph_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo pH
+    ec_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo EC
+
+    let temp_pin =
+        PinDriver::input_output(peripherals.pins.gpio6, esp_idf_hal::gpio::Pull::Up).unwrap();
+    let mut ds18b20 = HydroponicTempSensor::new(temp_pin).unwrap();
+
+    let trig_pin = PinDriver::output(peripherals.pins.gpio10).unwrap();
+    let echo_pin = PinDriver::input(peripherals.pins.gpio7, esp_idf_hal::gpio::Pull::Up).unwrap();
+    let mut jsn_sensor = JsnSr04t::new(trig_pin, echo_pin).unwrap();
 
     let shared_sensor_data_clone = shared_sensor_data.clone();
     let shared_config_clone = shared_config.clone();
@@ -156,26 +157,13 @@ fn main() -> anyhow::Result<()> {
         .stack_size(8192) // Cấp phát 8KB Stack
         .name("sensor_thread".to_string())
         .spawn(move || {
-            info!("Đang khởi tạo phần cứng Cảm biến...");
-
+            // 🟢 KHỞI TẠO ADC TRONG THREAD ĐỂ TRÁNH LỖI LIFETIME (LỖI E0597, E0505)
             let mut adc1 = AdcDriver::new(adc1_periph).unwrap();
-
             let mut adc_config = AdcChannelConfig::default();
             adc_config.attenuation = DB_11;
 
-            let mut ph_chan = AdcChannelDriver::new(&adc1, pin_gpio4, &adc_config).unwrap();
-            let mut ec_chan = AdcChannelDriver::new(&adc1, pin_gpio5, &adc_config).unwrap();
-
-            let ph_mosfet = PinDriver::output(pin_gpio8).unwrap();
-            let ec_mosfet = PinDriver::output(pin_gpio9).unwrap();
-            let mut isolated_reader = IsolatedPhEcReader::new(ph_mosfet, ec_mosfet).unwrap();
-
-            let temp_pin = PinDriver::input_output(pin_gpio6, esp_idf_hal::gpio::Pull::Up).unwrap();
-            let mut ds18b20 = HydroponicTempSensor::new(temp_pin).unwrap();
-
-            let trig_pin = PinDriver::output(pin_gpio10).unwrap();
-            let echo_pin = PinDriver::input(pin_gpio7, esp_idf_hal::gpio::Pull::Up).unwrap();
-            let mut jsn_sensor = JsnSr04t::new(trig_pin, echo_pin).unwrap();
+            let mut ph_chan = AdcChannelDriver::new(&adc1, ph_pin, &adc_config).unwrap();
+            let mut ec_chan = AdcChannelDriver::new(&adc1, ec_pin, &adc_config).unwrap();
 
             // CÁC BỘ ĐỆM DÀNH CHO MOVING AVERAGE
             let mut temp_history: VecDeque<f32> = VecDeque::new();
@@ -183,46 +171,80 @@ fn main() -> anyhow::Result<()> {
             let mut ph_history: VecDeque<f32> = VecDeque::new();
             let mut ec_history: VecDeque<f32> = VecDeque::new();
 
-            info!("🔬 Khởi động luồng đọc cảm biến (Time-Multiplexing + Moving Average)...");
+            // Thêm các biến lưu giữ giá trị thực tế hợp lệ cuối cùng
+            let mut last_valid_temp = 25.0;
+            let mut last_valid_water = 380.0;
+            let mut last_valid_ph = 7.0;
+            let mut last_valid_ec = 1.0;
+
+            info!("🔬 Khởi động luồng đọc cảm biến (Đọc ADC trực tiếp + Moving Average)...");
             loop {
                 // Lấy config mới nhất ở đầu mỗi vòng lặp để cập nhật cờ
                 let config = shared_config_clone.read().unwrap().clone();
                 let window_size = config.moving_average_window.max(1) as usize;
 
-                // 1. ĐỌC THÔ TỪ CÁC CẢM BIẾN (Chỉ đọc khi cờ enable = true)
+                // 1. ĐỌC THÔ TỪ CÁC CẢM BIẾN
 
-                let mut raw_temp = 25.0; // Mặc định an toàn
+                // --- TEMPERATURE ---
+                let mut raw_temp = last_valid_temp; // Mặc định dùng giá trị thực tế cũ
                 if config.enable_temp_sensor {
-                    if let Ok(Some(t)) = ds18b20.read_temperature() {
-                        raw_temp = t;
+                    match ds18b20.read_temperature() {
+                        Ok(Some(t)) => {
+                            raw_temp = t;
+                            last_valid_temp = t; // Cập nhật mốc mới
+                        }
+                        Ok(None) | Err(_) => {
+                            // warn!("⚠️ Lỗi đọc DS18B20 Temp, dùng giá trị cũ: {:.1}", raw_temp);
+                        }
                     }
                 }
 
-                let mut raw_water = config.water_level_target; // Giả lập nước đang ở mức tiêu chuẩn
+                // --- WATER LEVEL ---
+                let mut raw_water = last_valid_water;
                 if config.enable_water_level_sensor {
                     if let Some(w) = jsn_sensor.get_distance_cm() {
                         raw_water = w;
-                    } else {
-                        // Nếu đọc lỗi, giữ giá trị cũ để tránh nhiễu
-                        raw_water = *water_history.back().unwrap_or(&config.water_level_target);
+                        last_valid_water = w;
                     }
                 }
 
-                let mut raw_ph = config.ph_target; // Giả lập pH chuẩn
+                // --- pH SENSOR ---
+                let mut raw_ph = last_valid_ph;
                 if config.enable_ph_sensor {
-                    if let Ok(v_ph) =
-                        isolated_reader.read_ph_voltage(|| adc1.read(&mut ph_chan).unwrap_or(0))
-                    {
-                        raw_ph = convert_voltage_to_ph(v_ph, &config);
+                    // Đọc thẳng từ ADC, không qua delay của Isolate
+                    match adc1.read(&mut ph_chan) {
+                        Ok(raw_val) => {
+                            // Ép kiểu RAW sang Millivolt (S3 11dB đo tối đa ~3100mV tại 4095)
+                            let voltage_mv = raw_val as f32 * 3100.0 / 4095.0;
+                            raw_ph = convert_voltage_to_ph(voltage_mv, &config);
+                            last_valid_ph = raw_ph;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ Lỗi đọc thẳng ADC pH, dùng giá trị cũ: {:.2}. Lỗi: {:?}",
+                                raw_ph, e
+                            );
+                        }
                     }
                 }
 
-                let mut raw_ec = config.ec_target; // Giả lập EC chuẩn
+                // --- EC SENSOR ---
+                let mut raw_ec = last_valid_ec;
                 if config.enable_ec_sensor {
-                    if let Ok(v_ec) =
-                        isolated_reader.read_ec_voltage(|| adc1.read(&mut ec_chan).unwrap_or(0))
-                    {
-                        raw_ec = convert_voltage_to_ec(v_ec, raw_temp, &config);
+                    // Đọc thẳng từ ADC, không qua delay của Isolate
+                    match adc1.read(&mut ec_chan) {
+                        Ok(raw_val) => {
+                            // Ép kiểu RAW sang Millivolt
+                            let voltage_mv = raw_val as f32 * 3100.0 / 4095.0;
+                            raw_ec = convert_voltage_to_ec(voltage_mv, raw_temp, &config);
+                            last_valid_ec = raw_ec;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ Lỗi đọc thẳng ADC EC, dùng giá trị cũ: {:.2}. Lỗi: {:?}",
+                                raw_ec, e
+                            );
+                        }
                     }
                 }
 
@@ -373,10 +395,20 @@ fn main() -> anyhow::Result<()> {
                         let topic_config = format!("AGITECH/{}/controller/config", DEVICE_ID);
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
 
+                        // 🟢 THÊM MỚI: Báo cho Backend biết ESP32 đã Online
+                        let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
+                        let status_payload = r#"{"online": true}"#;
+                        let _ = client.publish(
+                            &topic_status,
+                            QoS::AtLeastOnce,
+                            true,
+                            status_payload.as_bytes(),
+                        );
+
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
                         let _ = client.subscribe(&topic_command, QoS::AtLeastOnce);
 
-                        info!("✅ Lệnh Subscribe đã được gửi thành công!");
+                        info!("✅ Lệnh Subscribe và báo Online đã được gửi thành công!");
                     }
                 }
                 ConnectionState::MqttDisconnected => {
@@ -408,7 +440,7 @@ fn main() -> anyhow::Result<()> {
                         current_ms
                     );
 
-                    let topic = format!("AGITECH/{}/sensor/data", DEVICE_ID);
+                    let topic = format!("AGITECH/{}/sensors", DEVICE_ID);
                     let _ = client.publish(&topic, QoS::AtMostOnce, false, payload.as_bytes());
                 }
                 last_sensor_publish = std::time::Instant::now();
@@ -418,7 +450,7 @@ fn main() -> anyhow::Result<()> {
         if let Ok(payload) = fsm_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
-                    let topic = format!("AGITECH/{}/controller/fsm", DEVICE_ID);
+                    let topic = format!("AGITECH/{}/fsm", DEVICE_ID);
                     let _ = client.publish(&topic, QoS::AtLeastOnce, false, payload.as_bytes());
                 }
             }
@@ -427,7 +459,7 @@ fn main() -> anyhow::Result<()> {
         if let Ok(report_json) = dosing_report_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
-                    let topic = format!("AGITECH/{}/controller/dosing_report", DEVICE_ID);
+                    let topic = format!("AGITECH/{}/dosing_report", DEVICE_ID);
                     let _ = client.publish(&topic, QoS::AtLeastOnce, false, report_json.as_bytes());
                 }
             }

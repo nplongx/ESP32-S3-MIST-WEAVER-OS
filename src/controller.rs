@@ -15,7 +15,6 @@ pub type SharedSensorData = Arc<RwLock<SensorData>>;
 pub enum PendingDose {
     EC {
         dose_ml: f32,
-        duration_ms: u64,
         target_ec: f32,
         pwm_percent: u32,
     },
@@ -45,7 +44,21 @@ pub enum SystemState {
         finish_time: u64,
         pending_action: PendingDose,
     },
-    DosingEC {
+    DosingPumpA {
+        finish_time: u64,
+        dose_ml: f32,
+        target_ec: f32,
+        start_ec: f32,
+        start_ph: f32,
+    },
+    WaitingBetweenDose {
+        finish_time: u64,
+        dose_ml: f32,
+        target_ec: f32,
+        start_ec: f32,
+        start_ph: f32,
+    },
+    DosingPumpB {
         finish_time: u64,
         dose_ml: f32,
         target_ec: f32,
@@ -76,7 +89,9 @@ impl SystemState {
             SystemState::SystemFault(reason) => format!("SystemFault:{}", reason),
             SystemState::WaterRefilling { .. } => "WaterRefilling".to_string(),
             SystemState::WaterDraining { .. } => "WaterDraining".to_string(),
-            SystemState::DosingEC { .. } => "DosingEC".to_string(),
+            SystemState::DosingPumpA { .. } => "DosingPumpA".to_string(),
+            SystemState::WaitingBetweenDose { .. } => "WaitingBetweenDose".to_string(),
+            SystemState::DosingPumpB { .. } => "DosingPumpB".to_string(),
             SystemState::DosingPH { .. } => "DosingPH".to_string(),
             SystemState::StartingOsakaPump { .. } => "StartingOsakaPump".to_string(),
             SystemState::ActiveMixing { .. } => "ActiveMixing".to_string(),
@@ -100,7 +115,6 @@ pub struct ControlContext {
     pub previous_ph_value: Option<f32>,
     pub last_continuous_level: bool,
 
-    // BIẾN QUẢN LÝ ĐA LUỒNG
     pub is_misting_active: bool,
     pub last_mist_toggle_time: u64,
     pub is_scheduled_mixing_active: bool,
@@ -109,7 +123,6 @@ pub struct ControlContext {
     pub current_osaka_pwm: u32,
     pub pump_status: PumpStatus,
 
-    // Quản lý thời gian tự động tắt cho chế độ Manual
     pub manual_timeouts: HashMap<String, u64>,
 }
 
@@ -149,7 +162,7 @@ impl ControlContext {
         self.is_scheduled_mixing_active = false;
         self.fsm_osaka_active = false;
         self.current_osaka_pwm = 0;
-        self.manual_timeouts.clear(); // Hủy toàn bộ timeout khi stop_all
+        self.manual_timeouts.clear();
     }
 
     fn reset_faults(&mut self) {
@@ -294,6 +307,7 @@ fn get_current_time_ms() -> u64 {
         .unwrap_or(Duration::from_secs(0))
         .as_millis() as u64
 }
+
 fn get_current_time_sec() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -337,10 +351,8 @@ pub fn start_fsm_control_loop(
             let current_time_ms = get_current_time_ms();
             let current_time_sec = current_time_ms / 1000;
 
-            // Xử lý lệnh Manual từ người dùng qua MQTT
             process_mqtt_commands(&cmd_rx, &config, &mut pump_ctrl, &mut ctx, current_time_ms);
 
-            // KIỂM TRA QUÁ HẠN (TIMEOUT) CHO CHẾ ĐỘ MANUAL
             let mut expired_pumps = Vec::new();
             for (pump, &finish_time) in &ctx.manual_timeouts {
                 if current_time_ms >= finish_time {
@@ -374,8 +386,6 @@ pub fn start_fsm_control_loop(
                 continue;
             }
 
-            // 🟢 TÍCH HỢP FLAG AN TOÀN VÀO KIỂM TRA NGƯỠNG
-            // Tránh báo lỗi giả làm treo hệ thống nếu người dùng đã tắt cờ cảm biến
             let is_water_critical = config.enable_water_level_sensor
                 && (sensors.water_level < config.water_level_critical_min);
 
@@ -393,7 +403,7 @@ pub fn start_fsm_control_loop(
                 || is_ph_out_of_bounds
             {
                 if ctx.current_state != SystemState::EmergencyStop {
-                    error!("⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống! (Vượt ngưỡng an toàn hoặc có lệnh kích hoạt)");
+                    error!("⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống!");
                     ctx.stop_all_pumps(&mut pump_ctrl);
                     ctx.current_state = SystemState::EmergencyStop;
                 }
@@ -406,9 +416,6 @@ pub fn start_fsm_control_loop(
                 info!("✅ Hệ thống an toàn trở lại.");
                 ctx.current_state = SystemState::Monitoring;
             } else if config.control_mode == ControlMode::Auto {
-                // ===============================================
-                // 🟢 LUỒNG 1: QUẢN LÝ PHUN SƯƠNG THEO NHIỆT ĐỘ
-                // ===============================================
                 let is_hot = config.enable_temp_sensor
                     && (sensors.temp_value >= config.misting_temp_threshold);
                 let on_duration = if is_hot {
@@ -438,9 +445,6 @@ pub fn start_fsm_control_loop(
                     }
                 }
 
-                // ===============================================
-                // 🟢 LUỒNG 2: LẬP LỊCH TRỘN (JET MIXING)
-                // ===============================================
                 if config.scheduled_mixing_interval_sec > 0
                     && config.scheduled_mixing_duration_sec > 0
                 {
@@ -464,9 +468,6 @@ pub fn start_fsm_control_loop(
                     ctx.is_scheduled_mixing_active = false;
                 }
 
-                // ===============================================
-                // 🟢 LUỒNG 3: FSM CHÂM PHÂN & BÙ NƯỚC
-                // ===============================================
                 if !matches!(ctx.current_state, SystemState::SystemFault(_)) {
                     run_auto_fsm(
                         current_time_ms,
@@ -479,9 +480,6 @@ pub fn start_fsm_control_loop(
                     );
                 }
 
-                // ===============================================
-                // 🟢 TRÁI TIM HỢP NHẤT: BƠM OSAKA VỚI PWM ĐỘNG
-                // ===============================================
                 let needs_osaka =
                     ctx.fsm_osaka_active || ctx.is_misting_active || ctx.is_scheduled_mixing_active;
 
@@ -497,10 +495,7 @@ pub fn start_fsm_control_loop(
                         ctx.pump_status.osaka_pump = true;
                         ctx.current_osaka_pwm = target_pwm;
                     } else if ctx.current_osaka_pwm != target_pwm {
-                        info!(
-                            "🔄 Đang điều chỉnh tốc độ Osaka sang {}% (Tránh xung đột tài nguyên)",
-                            target_pwm
-                        );
+                        info!("🔄 Đang điều chỉnh tốc độ Osaka sang {}%", target_pwm);
                         let _ = pump_ctrl.set_osaka_pump_pwm(target_pwm);
                         ctx.current_osaka_pwm = target_pwm;
                     }
@@ -520,7 +515,6 @@ pub fn start_fsm_control_loop(
                 ctx.current_state = SystemState::Monitoring;
             }
 
-            // Gửi cờ continuous level cho ESP32 sensor node
             let needs_continuous = matches!(
                 ctx.current_state,
                 SystemState::WaterRefilling { .. } | SystemState::WaterDraining { .. }
@@ -728,7 +722,8 @@ fn run_auto_fsm(
             ctx.verify_sensor_ack(sensors, config);
 
             // 1. Kiểm tra lịch thay nước
-            if config.scheduled_water_change_enabled
+            if config.enable_water_level_sensor
+                && config.scheduled_water_change_enabled
                 && (current_time_sec - ctx.last_water_change_time
                     > config.water_change_interval_sec)
             {
@@ -748,7 +743,8 @@ fn run_auto_fsm(
                 ctx.fsm_osaka_active = false;
             }
             // 2. Cấp nước tự động
-            else if config.auto_refill_enabled
+            else if config.enable_water_level_sensor
+                && config.auto_refill_enabled
                 && sensors.water_level < (config.water_level_target - config.water_level_tolerance)
             {
                 if ctx.water_refill_retry_count >= 3 {
@@ -767,7 +763,10 @@ fn run_auto_fsm(
                 }
             }
             // 3. Xả tràn tự động
-            else if config.auto_drain_overflow && sensors.water_level > config.water_level_max {
+            else if config.enable_water_level_sensor
+                && config.auto_drain_overflow
+                && sensors.water_level > config.water_level_max
+            {
                 ctx.current_state = SystemState::WaterDraining {
                     target_level: config.water_level_target,
                     start_time: current_time_ms,
@@ -778,7 +777,9 @@ fn run_auto_fsm(
                 ctx.fsm_osaka_active = false;
             }
             // 4. Pha loãng EC
-            else if config.auto_dilute_enabled
+            else if config.enable_ec_sensor
+                && config.enable_water_level_sensor
+                && config.auto_dilute_enabled
                 && sensors.ec_value > (config.ec_target + config.ec_tolerance)
             {
                 let target = (sensors.water_level - config.dilute_drain_amount_cm)
@@ -794,8 +795,10 @@ fn run_auto_fsm(
             } else {
                 let mut is_dosing_active = false;
 
-                // 5. Tính toán châm EC
-                if sensors.ec_value < (config.ec_target - config.ec_tolerance) {
+                // 5. Tính toán châm EC (Tính toán liều lượng cho cả A và B)
+                if config.enable_ec_sensor
+                    && sensors.ec_value < (config.ec_target - config.ec_tolerance)
+                {
                     if ctx.ec_retry_count >= 3 {
                         ctx.stop_all_pumps(pump_ctrl);
                         ctx.current_state =
@@ -803,21 +806,17 @@ fn run_auto_fsm(
                         is_dosing_active = true;
                     } else {
                         let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
-                        let active_capacity =
-                            config.dosing_pump_capacity_ml_per_sec * (safe_pwm as f32 / 100.0);
                         let dose_ml = ((config.ec_target - sensors.ec_value)
                             / config.ec_gain_per_ml
                             * config.ec_step_ratio)
                             .clamp(0.0, config.max_dose_per_cycle);
-                        let duration_ms = ((dose_ml / active_capacity) * 1000.0) as u64;
 
-                        if duration_ms > 0 {
+                        if dose_ml > 0.0 {
                             ctx.last_ec_before_dosing = Some(sensors.ec_value);
                             ctx.current_state = SystemState::StartingOsakaPump {
                                 finish_time: current_time_ms + config.soft_start_duration,
                                 pending_action: PendingDose::EC {
                                     dose_ml,
-                                    duration_ms,
                                     target_ec: config.ec_target,
                                     pwm_percent: safe_pwm,
                                 },
@@ -829,7 +828,8 @@ fn run_auto_fsm(
                 }
 
                 // 6. Tính toán chỉnh pH
-                if !is_dosing_active
+                if config.enable_ph_sensor
+                    && !is_dosing_active
                     && (sensors.ph_value - config.ph_target).abs() > config.ph_tolerance
                 {
                     if ctx.ph_retry_count >= 3 {
@@ -922,19 +922,20 @@ fn run_auto_fsm(
                 match action {
                     PendingDose::EC {
                         dose_ml,
-                        duration_ms,
                         target_ec,
                         pwm_percent,
                     } => {
                         let _ =
                             pump_ctrl.set_dosing_pump_pwm(PumpType::NutrientA, true, pwm_percent);
-                        let _ =
-                            pump_ctrl.set_dosing_pump_pwm(PumpType::NutrientB, true, pwm_percent);
                         ctx.pump_status.pump_a = true;
-                        ctx.pump_status.pump_b = true;
 
-                        ctx.current_state = SystemState::DosingEC {
-                            finish_time: current_time_ms + duration_ms,
+                        // Tính thời gian chạy Bơm A độc lập
+                        let active_capacity_a =
+                            config.pump_a_capacity_ml_per_sec * (pwm_percent as f32 / 100.0);
+                        let duration_ms_a = ((dose_ml / active_capacity_a) * 1000.0) as u64;
+
+                        ctx.current_state = SystemState::DosingPumpA {
+                            finish_time: current_time_ms + duration_ms_a,
                             dose_ml,
                             target_ec,
                             start_ec: sensors.ec_value,
@@ -976,19 +977,68 @@ fn run_auto_fsm(
             }
         }
 
-        SystemState::DosingEC {
+        // --- TRẠNG THÁI TUẦN TỰ MỚI CHO EC ---
+        SystemState::DosingPumpA {
             finish_time,
             dose_ml,
             target_ec,
-            start_ph,
             start_ec,
+            start_ph,
         } => {
             if current_time_ms >= finish_time {
                 let _ = pump_ctrl.set_dosing_pump_pwm(PumpType::NutrientA, false, 0);
                 ctx.pump_status.pump_a = false;
+
+                // Tắt bơm A, chuyển sang trạng thái chờ hòa tan
+                ctx.current_state = SystemState::WaitingBetweenDose {
+                    finish_time: current_time_ms + (config.delay_between_a_and_b_sec as u64 * 1000),
+                    dose_ml,
+                    target_ec,
+                    start_ec,
+                    start_ph,
+                };
+            }
+        }
+
+        SystemState::WaitingBetweenDose {
+            finish_time,
+            dose_ml,
+            target_ec,
+            start_ec,
+            start_ph,
+        } => {
+            if current_time_ms >= finish_time {
+                let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
+                let _ = pump_ctrl.set_dosing_pump_pwm(PumpType::NutrientB, true, safe_pwm);
+                ctx.pump_status.pump_b = true;
+
+                // Tính thời gian chạy Bơm B độc lập
+                let active_capacity_b =
+                    config.pump_b_capacity_ml_per_sec * (safe_pwm as f32 / 100.0);
+                let duration_ms_b = ((dose_ml / active_capacity_b) * 1000.0) as u64;
+
+                ctx.current_state = SystemState::DosingPumpB {
+                    finish_time: current_time_ms + duration_ms_b,
+                    dose_ml,
+                    target_ec,
+                    start_ec,
+                    start_ph,
+                };
+            }
+        }
+
+        SystemState::DosingPumpB {
+            finish_time,
+            dose_ml,
+            target_ec,
+            start_ec,
+            start_ph,
+        } => {
+            if current_time_ms >= finish_time {
                 let _ = pump_ctrl.set_dosing_pump_pwm(PumpType::NutrientB, false, 0);
                 ctx.pump_status.pump_b = false;
 
+                // Hoàn tất chu trình EC
                 let report_json = format!(
                     r#"{{"start_ec":{:.2},"start_ph":{:.2},"pump_a_ml":{:.2},"pump_b_ml":{:.2},"ph_up_ml":0.0,"ph_down_ml":0.0,"target_ec":{:.2},"target_ph":{:.2}}}"#,
                     start_ec, start_ph, dose_ml, dose_ml, target_ec, config.ph_target
@@ -999,7 +1049,7 @@ fn run_auto_fsm(
                 };
             }
         }
-
+        // -------------------------------------
         SystemState::DosingPH {
             finish_time,
             is_up,

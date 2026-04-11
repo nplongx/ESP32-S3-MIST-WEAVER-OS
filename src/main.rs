@@ -132,10 +132,10 @@ fn main() -> anyhow::Result<()> {
     let ec_pin = peripherals.pins.gpio5;
 
     // 🟢 Bỏ IsolatedPhEcReader, bật cứng 2 Mosfet để cấp nguồn liên tục
-    let mut ph_mosfet = PinDriver::output(peripherals.pins.gpio8).unwrap();
-    let mut ec_mosfet = PinDriver::output(peripherals.pins.gpio9).unwrap();
-    ph_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo pH
-    ec_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo EC
+    // let mut ph_mosfet = PinDriver::output(peripherals.pins.gpio8).unwrap();
+    // let mut ec_mosfet = PinDriver::output(peripherals.pins.gpio9).unwrap();
+    // ph_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo pH
+    // ec_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo EC
 
     let temp_pin =
         PinDriver::input_output(peripherals.pins.gpio6, esp_idf_hal::gpio::Pull::Up).unwrap();
@@ -186,7 +186,11 @@ fn main() -> anyhow::Result<()> {
                 // 1. ĐỌC THÔ TỪ CÁC CẢM BIẾN
 
                 // --- TEMPERATURE ---
-                let mut raw_temp = last_valid_temp; // Mặc định dùng giá trị thực tế cũ
+                let mut raw_temp = if config.enable_temp_sensor {
+                    last_valid_temp
+                } else {
+                    0.0
+                }; // Mặc định dùng giá trị thực tế cũ
                 if config.enable_temp_sensor {
                     match ds18b20.read_temperature() {
                         Ok(Some(t)) => {
@@ -194,13 +198,17 @@ fn main() -> anyhow::Result<()> {
                             last_valid_temp = t; // Cập nhật mốc mới
                         }
                         Ok(None) | Err(_) => {
-                            // warn!("⚠️ Lỗi đọc DS18B20 Temp, dùng giá trị cũ: {:.1}", raw_temp);
+                            warn!("⚠️ Lỗi đọc DS18B20 Temp, dùng giá trị cũ: {:.1}", raw_temp);
                         }
                     }
                 }
 
                 // --- WATER LEVEL ---
-                let mut raw_water = last_valid_water;
+                let mut raw_water = if config.enable_ph_sensor {
+                    last_valid_water
+                } else {
+                    0.0
+                };
                 if config.enable_water_level_sensor {
                     if let Some(w) = jsn_sensor.get_distance_cm() {
                         raw_water = w;
@@ -209,7 +217,11 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // --- pH SENSOR ---
-                let mut raw_ph = last_valid_ph;
+                let mut raw_ph = if config.enable_ph_sensor {
+                    last_valid_ph
+                } else {
+                    0.0
+                };
                 if config.enable_ph_sensor {
                     // Đọc thẳng từ ADC, không qua delay của Isolate
                     match adc1.read(&mut ph_chan) {
@@ -229,7 +241,11 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // --- EC SENSOR ---
-                let mut raw_ec = last_valid_ec;
+                let mut raw_ec = if config.enable_ec_sensor {
+                    last_valid_ec
+                } else {
+                    0.0
+                };
                 if config.enable_ec_sensor {
                     // Đọc thẳng từ ADC, không qua delay của Isolate
                     match adc1.read(&mut ec_chan) {
@@ -430,13 +446,27 @@ fn main() -> anyhow::Result<()> {
                         .unwrap_or_default()
                         .as_millis() as u64;
 
+                    let pumps = &sensors.pump_status;
+                    let current_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
                     let payload = format!(
-                        r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "timestamp_ms":{}}}"#,
-                        DEVICE_ID, // Frontend cần device_id để check
+                        r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "pump_status": {{"A":"{}", "B":"{}", "PH_UP":"{}", "PH_DOWN":"{}", "OSAKA_PUMP":"{}", "WATER_PUMP":"{}", "DRAIN_PUMP":"{}", "MIST_VALVE":"{}"}}, "timestamp_ms":{}}}"#,
+                        DEVICE_ID,
                         sensors.temp_value,
                         sensors.ec_value,
                         sensors.ph_value,
                         sensors.water_level,
+                        if pumps.pump_a { "on" } else { "off" },
+                        if pumps.pump_b { "on" } else { "off" },
+                        if pumps.ph_up { "on" } else { "off" },
+                        if pumps.ph_down { "on" } else { "off" },
+                        if pumps.osaka_pump { "on" } else { "off" },
+                        if pumps.water_pump_in { "on" } else { "off" },
+                        if pumps.water_pump_out { "on" } else { "off" },
+                        if pumps.mist_valve { "on" } else { "off" },
                         current_ms
                     );
 

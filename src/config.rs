@@ -60,7 +60,12 @@ pub struct DeviceConfig {
     pub sensor_stabilize_sec: u64,
     pub ec_step_ratio: f32,
     pub ph_step_ratio: f32,
+
     pub dosing_pump_capacity_ml_per_sec: f32,
+    pub pump_a_capacity_ml_per_sec: f32, // VD: 1.2 ml/s
+    pub pump_b_capacity_ml_per_sec: f32, // VD: 1.15 ml/s
+    pub delay_between_a_and_b_sec: u64,  // Độ trễ (Mix) giữa A và B, VD: 10 giây
+
     pub soft_start_duration: u64,
     pub scheduled_mixing_interval_sec: u64,
     pub scheduled_mixing_duration_sec: u64,
@@ -137,7 +142,13 @@ impl Default for DeviceConfig {
             sensor_stabilize_sec: 5,
             ec_step_ratio: 0.4,
             ph_step_ratio: 0.2,
+
             dosing_pump_capacity_ml_per_sec: 1.0,
+
+            pump_a_capacity_ml_per_sec: 1.2,  // VD: 1.2 ml/s
+            pump_b_capacity_ml_per_sec: 1.15, // VD: 1.15 ml/s
+            delay_between_a_and_b_sec: 10,    // Độ trễ (Mix) giữa A và B, VD: 10 giây
+
             soft_start_duration: 3000,
             scheduled_mixing_interval_sec: 3600,
             scheduled_mixing_duration_sec: 300,

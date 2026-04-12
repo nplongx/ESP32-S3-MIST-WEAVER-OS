@@ -351,7 +351,19 @@ pub fn start_fsm_control_loop(
             let current_time_ms = get_current_time_ms();
             let current_time_sec = current_time_ms / 1000;
 
-            process_mqtt_commands(&cmd_rx, &config, &mut pump_ctrl, &mut ctx, current_time_ms);
+            // 🟢 NHẬN TRẠNG THÁI SYNC TỪ HÀM XỬ LÝ LỆNH
+            let force_sync =
+                process_mqtt_commands(&cmd_rx, &config, &mut pump_ctrl, &mut ctx, current_time_ms);
+
+            // 🟢 THỰC THI LỆNH ĐỒNG BỘ NẾU APP VỪA MỞ LÊN
+            if force_sync {
+                // 1. Ép FSM gửi lại trạng thái (do chuỗi rỗng sẽ khác state hiện tại)
+                last_reported_state = "".to_string();
+
+                // 2. Gửi tín hiệu sang luồng Sensor để nó Publish MQTT liền lập tức
+                // (Giúp UI nhận ngay Pump Status mà không cần đợi 5 giây)
+                let _ = sensor_cmd_tx.send(r#"{"command":"force_publish"}"#.to_string());
+            }
 
             let mut expired_pumps = Vec::new();
             for (pump, &finish_time) in &ctx.manual_timeouts {
@@ -554,14 +566,24 @@ fn report_state_if_changed(
     }
 }
 
+// 🟢 ĐÃ SỬA: Đổi kiểu trả về thành bool để báo cho luồng chính biết có cần Sync hay không
 fn process_mqtt_commands(
     cmd_rx: &Receiver<MqttCommandPayload>,
     config: &DeviceConfig,
     pump_ctrl: &mut PumpController,
     ctx: &mut ControlContext,
     current_time_ms: u64,
-) {
+) -> bool {
+    let mut force_sync = false;
+
     while let Ok(cmd) = cmd_rx.try_recv() {
+        // 🟢 BẮT LỆNH SYNC TỪ APP ĐIỆN THOẠI
+        if cmd.action == "SYNC_STATUS" {
+            info!("🔄 YÊU CẦU ĐỒNG BỘ TỪ APP: Đang phản hồi trạng thái hiện tại...");
+            force_sync = true;
+            continue;
+        }
+
         if cmd.action == "reset_fault" {
             info!("🔄 Nhận lệnh Reset. Khôi phục hệ thống...");
             ctx.stop_all_pumps(pump_ctrl);
@@ -697,6 +719,8 @@ fn process_mqtt_commands(
             }
         };
     }
+
+    force_sync
 }
 
 // ==========================================

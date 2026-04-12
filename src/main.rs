@@ -126,16 +126,9 @@ fn main() -> anyhow::Result<()> {
     // ===============================
     info!("Chuẩn bị các chân Cảm biến...");
 
-    // 🟢 Chuyển các chân ADC và chân chức năng thành biến để move vào trong thread
     let adc1_periph = peripherals.adc1;
     let ph_pin = peripherals.pins.gpio4;
     let ec_pin = peripherals.pins.gpio5;
-
-    // 🟢 Bỏ IsolatedPhEcReader, bật cứng 2 Mosfet để cấp nguồn liên tục
-    // let mut ph_mosfet = PinDriver::output(peripherals.pins.gpio8).unwrap();
-    // let mut ec_mosfet = PinDriver::output(peripherals.pins.gpio9).unwrap();
-    // ph_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo pH
-    // ec_mosfet.set_high().unwrap(); // Cấp điện liên tục cho mạch đo EC
 
     let temp_pin =
         PinDriver::input_output(peripherals.pins.gpio6, esp_idf_hal::gpio::Pull::Up).unwrap();
@@ -148,16 +141,13 @@ fn main() -> anyhow::Result<()> {
     let shared_sensor_data_clone = shared_sensor_data.clone();
     let shared_config_clone = shared_config.clone();
 
-    // 🟢 TẠO CỜ GIAO TIẾP: TRUE = ĐỌC SIÊU TỐC, FALSE = ĐỌC BÌNH THƯỜNG
     let fast_sampling_mode = Arc::new(AtomicBool::new(false));
     let fast_sampling_clone = fast_sampling_mode.clone();
 
-    // THREAD CHẠY CẢM BIẾN
     std::thread::Builder::new()
-        .stack_size(8192) // Cấp phát 8KB Stack
+        .stack_size(8192)
         .name("sensor_thread".to_string())
         .spawn(move || {
-            // 🟢 KHỞI TẠO ADC TRONG THREAD ĐỂ TRÁNH LỖI LIFETIME (LỖI E0597, E0505)
             let mut adc1 = AdcDriver::new(adc1_periph).unwrap();
             let mut adc_config = AdcChannelConfig::default();
             adc_config.attenuation = DB_11;
@@ -165,13 +155,11 @@ fn main() -> anyhow::Result<()> {
             let mut ph_chan = AdcChannelDriver::new(&adc1, ph_pin, &adc_config).unwrap();
             let mut ec_chan = AdcChannelDriver::new(&adc1, ec_pin, &adc_config).unwrap();
 
-            // CÁC BỘ ĐỆM DÀNH CHO MOVING AVERAGE
             let mut temp_history: VecDeque<f32> = VecDeque::new();
             let mut water_history: VecDeque<f32> = VecDeque::new();
             let mut ph_history: VecDeque<f32> = VecDeque::new();
             let mut ec_history: VecDeque<f32> = VecDeque::new();
 
-            // Thêm các biến lưu giữ giá trị thực tế hợp lệ cuối cùng
             let mut last_valid_temp = 25.0;
             let mut last_valid_water = 380.0;
             let mut last_valid_ph = 7.0;
@@ -179,32 +167,33 @@ fn main() -> anyhow::Result<()> {
 
             info!("🔬 Khởi động luồng đọc cảm biến (Đọc ADC trực tiếp + Moving Average)...");
             loop {
-                // Lấy config mới nhất ở đầu mỗi vòng lặp để cập nhật cờ
                 let config = shared_config_clone.read().unwrap().clone();
                 let window_size = config.moving_average_window.max(1) as usize;
 
-                // 1. ĐỌC THÔ TỪ CÁC CẢM BIẾN
+                extern "C" {
+                    fn read_ds18b20_temperature_from_c() -> f32;
+                }
 
-                // --- TEMPERATURE ---
                 let mut raw_temp = if config.enable_temp_sensor {
                     last_valid_temp
                 } else {
                     0.0
-                }; // Mặc định dùng giá trị thực tế cũ
+                };
+
                 if config.enable_temp_sensor {
-                    match ds18b20.read_temperature() {
-                        Ok(Some(t)) => {
-                            raw_temp = t;
-                            last_valid_temp = t; // Cập nhật mốc mới
-                        }
-                        Ok(None) | Err(_) => {
-                            warn!("⚠️ Lỗi đọc DS18B20 Temp, dùng giá trị cũ: {:.1}", raw_temp);
-                        }
+                    let temp_c = unsafe { read_ds18b20_temperature_from_c() };
+                    if temp_c > -50.0 && temp_c < 125.0 {
+                        raw_temp = temp_c;
+                        last_valid_temp = raw_temp;
+                    } else {
+                        log::warn!(
+                            "⚠️ Lỗi từ code C DS18B20, dùng lại giá trị cũ: {:.1}",
+                            raw_temp
+                        );
                     }
                 }
 
-                // --- WATER LEVEL ---
-                let mut raw_water = if config.enable_ph_sensor {
+                let mut raw_water = if config.enable_water_level_sensor {
                     last_valid_water
                 } else {
                     0.0
@@ -216,17 +205,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // --- pH SENSOR ---
                 let mut raw_ph = if config.enable_ph_sensor {
                     last_valid_ph
                 } else {
                     0.0
                 };
                 if config.enable_ph_sensor {
-                    // Đọc thẳng từ ADC, không qua delay của Isolate
                     match adc1.read(&mut ph_chan) {
                         Ok(raw_val) => {
-                            // Ép kiểu RAW sang Millivolt (S3 11dB đo tối đa ~3100mV tại 4095)
                             let voltage_mv = raw_val as f32 * 3100.0 / 4095.0;
                             raw_ph = convert_voltage_to_ph(voltage_mv, &config);
                             last_valid_ph = raw_ph;
@@ -240,17 +226,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // --- EC SENSOR ---
                 let mut raw_ec = if config.enable_ec_sensor {
                     last_valid_ec
                 } else {
                     0.0
                 };
                 if config.enable_ec_sensor {
-                    // Đọc thẳng từ ADC, không qua delay của Isolate
                     match adc1.read(&mut ec_chan) {
                         Ok(raw_val) => {
-                            // Ép kiểu RAW sang Millivolt
                             let voltage_mv = raw_val as f32 * 3100.0 / 4095.0;
                             raw_ec = convert_voltage_to_ec(voltage_mv, raw_temp, &config);
                             last_valid_ec = raw_ec;
@@ -264,7 +247,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // 2. HÀM CLOSURE ĐỂ CẬP NHẬT LỊCH SỬ & TÍNH TRUNG BÌNH CỘNG
                 let mut calc_avg = |history: &mut VecDeque<f32>, new_val: f32| -> f32 {
                     history.push_back(new_val);
                     while history.len() > window_size {
@@ -274,13 +256,11 @@ fn main() -> anyhow::Result<()> {
                     sum / (history.len() as f32)
                 };
 
-                // 3. ÁP DỤNG MOVING AVERAGE
                 let avg_temp = calc_avg(&mut temp_history, raw_temp);
                 let avg_water = calc_avg(&mut water_history, raw_water);
                 let avg_ph = calc_avg(&mut ph_history, raw_ph);
                 let avg_ec = calc_avg(&mut ec_history, raw_ec);
 
-                // 4. LƯU GIÁ TRỊ ĐÃ LỌC VÀO SHARED MEMORY CHO FSM
                 {
                     let mut data = shared_sensor_data_clone.write().unwrap();
                     data.temp_value = avg_temp;
@@ -294,12 +274,11 @@ fn main() -> anyhow::Result<()> {
                     avg_temp, avg_water, avg_ph, avg_ec
                 );
 
-                // 5. THAY ĐỔI TỐC ĐỘ LẤY MẪU DỰA VÀO LỆNH CỦA FSM
                 let is_fast_mode = fast_sampling_clone.load(Ordering::Relaxed);
                 let delay_ms = if is_fast_mode {
-                    200 // Đọc rất nhanh (5 lần/giây) khi bơm đang xả/cấp nước
+                    200
                 } else {
-                    config.sampling_interval // Bình thường (vd 1000ms)
+                    config.sampling_interval
                 };
 
                 thread::sleep(Duration::from_millis(delay_ms));
@@ -311,7 +290,7 @@ fn main() -> anyhow::Result<()> {
     let fsm_nvs = nvs.clone();
 
     std::thread::Builder::new()
-        .stack_size(10240) // Cấp hẳn 10KB cho FSM vì đây là "não bộ" của hệ thống
+        .stack_size(10240)
         .name("fsm_thread".to_string())
         .spawn(move || {
             start_fsm_control_loop(
@@ -377,6 +356,7 @@ fn main() -> anyhow::Result<()> {
     info!("🔄 Đang chạy Main Event Loop...");
 
     let mut last_sensor_publish = std::time::Instant::now();
+    let mut force_publish_next = false; // 🟢 THÊM BIẾN CỜ ÉP PUBLISH
 
     loop {
         if let Ok(state) = conn_rx.try_recv() {
@@ -411,13 +391,12 @@ fn main() -> anyhow::Result<()> {
                         let topic_config = format!("AGITECH/{}/controller/config", DEVICE_ID);
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
 
-                        // 🟢 THÊM MỚI: Báo cho Backend biết ESP32 đã Online
                         let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
                         let status_payload = r#"{"online": true}"#;
                         let _ = client.publish(
                             &topic_status,
                             QoS::AtLeastOnce,
-                            true,
+                            false,
                             status_payload.as_bytes(),
                         );
 
@@ -434,11 +413,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Logic Publish MQTT Định kỳ
+        // Logic Publish MQTT Định kỳ hoặc Ép buộc
         if is_mqtt_connected {
             let interval_ms = shared_config.read().unwrap().publish_interval;
 
-            if last_sensor_publish.elapsed().as_millis() as u64 >= interval_ms {
+            // 🟢 THAY ĐỔI ĐIỀU KIỆN PUBLISH: Đợi hết giờ HOẶC có lệnh force_publish
+            if force_publish_next || last_sensor_publish.elapsed().as_millis() as u64 >= interval_ms
+            {
                 if let Some(client) = mqtt_client.as_mut() {
                     let sensors = shared_sensor_data.read().unwrap().clone();
                     let current_ms = std::time::SystemTime::now()
@@ -447,10 +428,6 @@ fn main() -> anyhow::Result<()> {
                         .as_millis() as u64;
 
                     let pumps = &sensors.pump_status;
-                    let current_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
 
                     let payload = format!(
                         r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "pump_status": {{"pump_a":{}, "pump_b":{}, "ph_up":{}, "ph_down":{}, "osaka_pump":{}, "water_pump_in":{}, "water_pump_out":{}, "mist_valve":{}}}, "timestamp_ms":{}}}"#,
@@ -459,21 +436,26 @@ fn main() -> anyhow::Result<()> {
                         sensors.ec_value,
                         sensors.ph_value,
                         sensors.water_level,
-                        pumps.pump_a, // Trong Rust, format "{}" cho bool sẽ tự in ra chữ true/false (không có dấu ngoặc kép)
+                        pumps.pump_a,
                         pumps.pump_b,
                         pumps.ph_up,
                         pumps.ph_down,
                         pumps.osaka_pump,
-                        pumps.water_pump_in, // Map chuẩn với tên biến backend thay vì "WATER_PUMP"
-                        pumps.water_pump_out, // Map chuẩn với tên biến backend thay vì "DRAIN_PUMP"
+                        pumps.water_pump_in,
+                        pumps.water_pump_out,
                         pumps.mist_valve,
                         current_ms
                     );
 
                     let topic = format!("AGITECH/{}/sensors", DEVICE_ID);
                     let _ = client.publish(&topic, QoS::AtMostOnce, false, payload.as_bytes());
+
+                    if force_publish_next {
+                        info!("🚀 Đã Publish cưỡng bức (Force Publish) trạng thái hiện tại!");
+                    }
                 }
                 last_sensor_publish = std::time::Instant::now();
+                force_publish_next = false; // Reset cờ sau khi publish
             }
         }
 
@@ -495,9 +477,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // 🟢 CƠ CHẾ COMMAND MỚI: Bắt lệnh nội bộ từ FSM và chuyển thành Cờ (Flag) trong RAM
+        // 🟢 CƠ CHẾ COMMAND: Phân loại lệnh nội bộ từ FSM
         if let Ok(sensor_cmd_json) = sensor_cmd_rx.try_recv() {
-            if sensor_cmd_json.contains("\"state\": true")
+            if sensor_cmd_json.contains("\"command\":\"force_publish\"") {
+                force_publish_next = true; // 🟢 Bật cờ để publish ngay ở vòng lặp tiếp theo
+            } else if sensor_cmd_json.contains("\"state\": true")
                 || sensor_cmd_json.contains("\"state\":true")
             {
                 fast_sampling_mode.store(true, Ordering::Relaxed);
@@ -508,6 +492,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        thread::sleep(Duration::from_millis(100)); // Nhường CPU
+        thread::sleep(Duration::from_millis(50)); // Giảm xuống 50ms để bắt lệnh nội bộ nhạy hơn
     }
 }
+

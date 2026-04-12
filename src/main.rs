@@ -453,20 +453,20 @@ fn main() -> anyhow::Result<()> {
                         .as_millis() as u64;
 
                     let payload = format!(
-                        r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "pump_status": {{"A":"{}", "B":"{}", "PH_UP":"{}", "PH_DOWN":"{}", "OSAKA_PUMP":"{}", "WATER_PUMP":"{}", "DRAIN_PUMP":"{}", "MIST_VALVE":"{}"}}, "timestamp_ms":{}}}"#,
+                        r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "pump_status": {{"pump_a":{}, "pump_b":{}, "ph_up":{}, "ph_down":{}, "osaka_pump":{}, "water_pump_in":{}, "water_pump_out":{}, "mist_valve":{}}}, "timestamp_ms":{}}}"#,
                         DEVICE_ID,
                         sensors.temp_value,
                         sensors.ec_value,
                         sensors.ph_value,
                         sensors.water_level,
-                        if pumps.pump_a { "on" } else { "off" },
-                        if pumps.pump_b { "on" } else { "off" },
-                        if pumps.ph_up { "on" } else { "off" },
-                        if pumps.ph_down { "on" } else { "off" },
-                        if pumps.osaka_pump { "on" } else { "off" },
-                        if pumps.water_pump_in { "on" } else { "off" },
-                        if pumps.water_pump_out { "on" } else { "off" },
-                        if pumps.mist_valve { "on" } else { "off" },
+                        pumps.pump_a, // Trong Rust, format "{}" cho bool sẽ tự in ra chữ true/false (không có dấu ngoặc kép)
+                        pumps.pump_b,
+                        pumps.ph_up,
+                        pumps.ph_down,
+                        pumps.osaka_pump,
+                        pumps.water_pump_in, // Map chuẩn với tên biến backend thay vì "WATER_PUMP"
+                        pumps.water_pump_out, // Map chuẩn với tên biến backend thay vì "DRAIN_PUMP"
+                        pumps.mist_valve,
                         current_ms
                     );
 

@@ -1119,4 +1119,3 @@ fn run_auto_fsm(
         SystemState::EmergencyStop => {}
     }
 }
-

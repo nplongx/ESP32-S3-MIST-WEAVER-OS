@@ -77,4 +77,3 @@ impl<'a> HydroponicTempSensor<'a> {
         Ok(Some(sensor_data.temperature))
     }
 }
-

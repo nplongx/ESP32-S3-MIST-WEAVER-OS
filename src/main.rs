@@ -124,11 +124,11 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 if current_config_hash != last_config_hash {
-                    // 🟢 Gửi đầy đủ các cờ enable xuống C3
                     let config_json = format!(
-                        r#"{{"ph_v7":{:.1}, "ph_v4":{:.1}, "ec_f":{:.2}, "beta":{:.3}, "en_ph":{}, "en_ec":{}, "en_temp":{}, "en_water":{}}}"#,
+                        r#"{{"ph_v7":{:.1}, "ph_v4":{:.1}, "ec_f":{:.2}, "beta":{:.3}, "en_ph":{}, "en_ec":{}, "en_temp":{}, "en_water":{}, "ma_window":{}}}"#,
                         config.ph_v7, config.ph_v4, config.ec_factor, config.temp_compensation_beta,
-                        config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor, config.enable_water_level_sensor
+                        config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor, config.enable_water_level_sensor, 
+                        config.moving_average_window
                     );
                     
                     let payload = format!("{}\n", config_json);
